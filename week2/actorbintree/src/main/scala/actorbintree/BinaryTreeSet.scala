@@ -96,6 +96,7 @@ class BinaryTreeSet extends Actor with ActorLogging {
       pendingQueue = pendingQueue :+ m
     case CopyFinished =>
       log.info("Set/garbageCollecting: CopyFinished received")
+      root ! PoisonPill
       root = newRoot
       pendingQueue foreach {
         newRoot ! _
