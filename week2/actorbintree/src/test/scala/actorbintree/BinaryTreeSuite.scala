@@ -41,6 +41,30 @@ class BinaryTreeSuite extends TestKit(ActorSystem("BinaryTreeSuite")) with Impli
     // the grader also verifies that enough actors are created
   }
 
+
+
+  @Test def `GC on a new tree (Mine)`(): Unit = {
+    val topNode = system.actorOf(Props[BinaryTreeSet])
+
+    topNode ! GC
+    topNode ! Insert(testActor, id = 2, 1)
+    topNode ! Contains(testActor, id = 3, 1)
+    topNode ! Remove(testActor, id = 4, 1)
+    topNode ! GC
+    topNode ! Contains(testActor, id = 5, 1)
+
+    expectMsg(OperationFinished(2))
+    expectMsg(ContainsResult(3, true))
+    expectMsg(OperationFinished(4))
+    expectMsg(ContainsResult(5, false))
+//
+//    topNode ! Insert(testActor, id = 2, 1)
+//
+//    expectMsg(OperationFinished(2))
+//    expectMsg(ContainsResult(3, true))
+    ()
+  }
+
   @Test def `proper inserts and lookups (5pts)`(): Unit = {
     val topNode = system.actorOf(Props[BinaryTreeSet])
 
@@ -98,7 +122,7 @@ class BinaryTreeSuite extends TestKit(ActorSystem("BinaryTreeSuite")) with Impli
       var referenceSet = Set.empty[Int]
       def replyFor(op: Operation): OperationReply = op match {
         case Insert(_, seq, elem) =>
-          referenceSet = referenceSet +
+          referenceSet = referenceSet + elem
           OperationFinished(seq)
         case Remove(_, seq, elem) =>
           referenceSet = referenceSet - elem
@@ -111,7 +135,7 @@ class BinaryTreeSuite extends TestKit(ActorSystem("BinaryTreeSuite")) with Impli
     }
 
     val requester = TestProbe()
-    val topNode = system.actorOf(Props[BinaryTreeSet])
+    val topNode = system.actorOf(Props[BinaryTreeSet], name = "BinaryTreeSet")
     val count = 1000
 
     val ops = randomOperations(requester.ref, count)
