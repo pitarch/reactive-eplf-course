@@ -1,6 +1,7 @@
 package kvstore
 
-import akka.actor.{Props, Actor}
+import akka.actor.{Actor, ActorLogging, Props}
+
 import scala.util.Random
 
 object Persistence {
@@ -12,7 +13,7 @@ object Persistence {
   def props(flaky: Boolean): Props = Props(classOf[Persistence], flaky)
 }
 
-class Persistence(flaky: Boolean) extends Actor {
+class Persistence(flaky: Boolean) extends Actor with ActorLogging {
   import Persistence._
 
   def receive = {

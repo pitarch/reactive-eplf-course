@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{ActorRef, Actor}
+import akka.actor.{Actor, ActorLogging, ActorRef}
 
 object Arbiter {
   case object Join
@@ -14,7 +14,7 @@ object Arbiter {
   case class Replicas(replicas: Set[ActorRef])
 }
 
-class Arbiter extends Actor {
+class Arbiter extends Actor with ActorLogging {
   import Arbiter._
   var leader: Option[ActorRef] = None
   var replicas = Set.empty[ActorRef]

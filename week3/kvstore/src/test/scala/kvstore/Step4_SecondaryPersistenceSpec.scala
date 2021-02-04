@@ -13,9 +13,9 @@ trait Step4_SecondaryPersistenceSpec { this: KVStoreSuite =>
   @Test def `Step4-case1: Secondary should not acknowledge snapshots until persisted`(): Unit = {
     import Replicator._
 
-    val arbiter = TestProbe()
-    val persistence = TestProbe()
-    val replicator = TestProbe()
+    val arbiter = TestProbe("arbiter0")
+    val persistence = TestProbe("persistence0")
+    val replicator = TestProbe("replicator0")
     val secondary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "step4-case1-secondary")
     val client = session(secondary)
 
