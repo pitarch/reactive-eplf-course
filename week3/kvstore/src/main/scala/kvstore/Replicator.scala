@@ -1,12 +1,10 @@
 package kvstore
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
-import akka.pattern.{ask, pipe}
+import akka.pattern.{AskTimeoutException, ask}
 import akka.util.Timeout
 
-import java.util.concurrent.TimeoutException
-import scala.annotation.tailrec
-import scala.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.DurationInt
 import scala.util.{Failure, Success}
 
@@ -46,29 +44,44 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
     ret
   }
 
-  implicit val timeout = Timeout(200.millis)
+  implicit val timeout = Timeout(100.millis)
 
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
-    case message@Replicate(key, valueOption, _) =>
-      val seq = nextSeq()
-      acks = acks.updated(seq, (sender, message))
-      retrySnapshot(key, valueOption, seq) pipeTo self
-    case SnapshotAck(_, seq) =>
-      val entry = acks.get(seq)
-      acks = acks.removed(seq)
-      entry.foreach {
-        case (replicaRef, Replicate(key, _, id)) => replicaRef ! Replicated(key, id)
-      }
+
+    case message: Replicate =>
+      log.debug(s"Replicator: Received message $message from ${sender.path}")
+      replicate(sender, message)
+
+    //    case SnapshotAck(_, seq) =>
+    //      val entry = acks.get(seq)
+    //      acks = acks.removed(seq)
+    //      entry.foreach {
+    //        case (replicaRef, Replicate(key, _, id)) => replicaRef ! Replicated(key, id)
+    //      }
   }
 
 
-  protected def retrySnapshot(key: String, optValue: Option[String], seq: Long): Future[Any] = {
-    val future = replica ? Snapshot(key, optValue, seq)
-    future.recoverWith {
-      case t:TimeoutException => retrySnapshot(key, optValue, seq)
+  protected def replicate(leader: ActorRef, replicate: Replicate): Unit = {
+    val snapshot = Snapshot(replicate.key, replicate.valueOption, nextSeq())
+    val shouldRetry = new AtomicBoolean(true)
+    context.system.scheduler.scheduleOnce(1.second) {
+      shouldRetry.set(false)
     }
+
+    def sendSnapshot(): Unit = {
+      log.debug(s"Replicator: Sending $snapshot to replica ${replica.path}")
+      (replica ? snapshot) (Timeout(100.millis)).onComplete {
+        case Failure(exception) if exception.isInstanceOf[AskTimeoutException] =>
+          log.debug(s"Replicator: received Timeout by $snapshot. Resending? ${shouldRetry}")
+          if (shouldRetry.get()) sendSnapshot()
+        case Success(m@SnapshotAck(key, id)) =>
+          log.debug(s"Replicator: Get $m from replica ${replica.path}. Sending Replicated to leader ${leader.path}")
+          leader ! Replicated(key, id)
+      }
+    }
+
+    sendSnapshot()
+
   }
-
-
 }

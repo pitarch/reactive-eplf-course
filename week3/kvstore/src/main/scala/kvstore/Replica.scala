@@ -1,12 +1,14 @@
 package kvstore
 
-import akka.actor.{Actor, ActorLogging, ActorRef, Props}
+import akka.actor.{Actor, ActorLogging, ActorRef, Cancellable, Props}
 import akka.pattern.{AskTimeoutException, ask, pipe}
 import akka.util.Timeout
 import kvstore.Arbiter._
-import kvstore.Persistence.Persisted
-import kvstore.Replicator.{Replicate, Snapshot, SnapshotAck}
+import kvstore.Persistence.{Persist, Persisted}
+import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
+import java.util.concurrent.atomic.AtomicBoolean
+import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
 import scala.util.{Failure, Success}
 
@@ -55,59 +57,75 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
-  var persister: Option[ActorRef] = None
-  var replicationCounter = 0L
-  var replications = Map.empty[ActorRef, Set[Long]]
+
+  // mine
+  var myPersister: Option[ActorRef] = None
   var snapshotExpectedSeqs: Map[ActorRef, Long] = Map.empty[ActorRef, Long].withDefaultValue(0)
   var myPersistedExpected: Map[(String, Long), ActorRef] = Map.empty
 
-  def nextReplicationCounter() = {
-    val value = replicationCounter
-    replicationCounter += 1
-    value
-  }
 
-  implicit val timeout = Timeout(1.second)
+  implicit val timeout: Timeout = Timeout(1.second)
 
   import context.dispatcher
 
   arbiter ! Join
 
   def receive = {
+
     case JoinedPrimary =>
-      persister = Some(context.actorOf(persistenceProps))
+      myPersister = Some(context.actorOf(persistenceProps))
       context.become(leader)
+
     case JoinedSecondary =>
-      persister = Some(context.actorOf(persistenceProps))
+      myPersister = Some(context.actorOf(persistenceProps))
       context.become(replica)
   }
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
 
-    case Insert(key, value, id) =>
+    case m@Insert(key, value, id) =>
+      log.debug(s"Replica/Leader: received $m")
       kv = kv.updated(key, value)
-      persist(key, Some(value), id, sender)
+      processInsertOrRemoveOnLeader(sender, id, key, Some(value))
+
     case Remove(key, id) =>
       kv = kv.removed(key)
-      persist(key, None, id, sender)
+      processInsertOrRemoveOnLeader(sender, id, key, None)
+
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
+
     case Replicas(replicas) =>
-      replicas
-        .find { replica => !secondaries.contains(replica) }
-        .foreach { replica =>
-          val replicator = context.actorOf(Replicator.props(replica))
-          //          replicators += replicator
-          //          secondaries += (replica, replicator)
-          val counter = nextReplicationCounter()
-          //          replications += (replicator, Set.empty)
-          kv.foreach {
-            case (key, value) =>
-              replicator ! Replicate(key, Some(value), counter)
-            //replications.
-          }
+      val newReplicaReplicators = replicas
+        .filterNot(_ == self)
+        .filterNot(secondaries.contains)
+        .map { replica => (replica, context.actorOf(Replicator.props(replica))) }
+        .toMap
+
+
+      newReplicaReplicators.foreach { case (replica, replicator) =>
+        log.debug(s"Replica/Leader: Sending Replicate for all entries in the store to replicator [${replicator.path}]: ${kv}")
+        kv.foreach {
+          case (key, value) => replicator ! Replicate(key, Some(value), 0L)
         }
+      }
+
+      secondaries = secondaries ++ newReplicaReplicators
+
+    case m@Persisted(key, id) =>
+      log.debug(s"Replicate/Primary: Received message: $m")
+  }
+
+  def replicate(key: String, optValue: Option[String], id: Long) = {
+    secondaries
+      .filterNot { case (replica, _) => replica == self }
+      .map { case (replica, replicator) =>
+        val message = Replicate(key, optValue, id)
+        log.debug(s"Replica/Leader: asking $message to replicator [${replicator.path}]")
+        val future = replicator ? message
+        future.foreach { case Replicated(key, id) => replica }
+      }
   }
 
   /* TODO Behavior for the replica role. */
@@ -116,32 +134,36 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
 
-    case Snapshot(key, optValue, seq) => // sender: Replicator
+    case m@Snapshot(key, optValue, seq) => // sender: Replicator
       val replicator = sender
       val expectedSeq = snapshotExpectedSeqs(replicator)
-      if (seq == expectedSeq) {
-        myPersistedExpected = myPersistedExpected.updated((key, seq), replicator)
-        snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, seq + 1)
-        retryPersistOnSnapshot(key, optValue, seq, replicator)
+      log.debug(s"Replicate/Secondary: received message $m from replicator [${replicator.path}]. expected seq=${expectedSeq}")
+      if (seq > expectedSeq) {
+        // nothing
+      } else if (seq < expectedSeq) {
+        replicator ! SnapshotAck(key, seq)
+        //snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, expectedSeq + 1)
+      } else {
+        log.debug(s"Updated local store (key=$key, value=$optValue)")
         optValue match {
           case Some(value) => kv = kv.updated(key, value)
           case None => kv = kv.removed(key)
         }
-      } else if ((seq < expectedSeq)) {
-        //snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, seq + 1)
-        replicator ! SnapshotAck(key, seq)
+        myPersistedExpected = myPersistedExpected.updated((key, seq), replicator)
+        snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, seq + 1)
+        processSnapshotPersist(replicator, m)
       }
 
-    case MyRetrySnapshotPersistence(replicator, key, optValue, seq) =>
-      log.debug(s"MyRetrySnapshotPersistence: key=$key, value=$optValue, seq=$seq")
-      retryPersistOnSnapshot(key, optValue, seq, replicator)
-
-    case MyPersistenceConfirmed(replicator, key, seq) =>
-      val replicatorOpt = myPersistedExpected.get((key, seq))
-      if (replicatorOpt.isDefined) {
-        replicatorOpt.get ! SnapshotAck(key, seq)
-        myPersistedExpected = myPersistedExpected.removed((key, seq))
-      }
+//    case MyRetrySnapshotPersistence(replicator, key, optValue, seq) =>
+//      log.debug(s"MyRetrySnapshotPersistence: key=$key, value=$optValue, seq=$seq")
+//      retryPersistOnSnapshot(key, optValue, seq, replicator)
+//
+//    case MyPersistenceConfirmed(replicator, key, seq) =>
+//      val replicatorOpt = myPersistedExpected.get((key, seq))
+//      if (replicatorOpt.isDefined) {
+//        replicatorOpt.get ! SnapshotAck(key, seq)
+//        myPersistedExpected = myPersistedExpected.removed((key, seq))
+//      }
 
     case Persisted(key, seq) =>
       val replicatorOpt = myPersistedExpected.get((key, seq))
@@ -151,21 +173,96 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       }
   }
 
+  @Deprecated
   protected def retryPersistOnSnapshot(key: String, optValue: Option[String], seq: Long, replicator: ActorRef): Unit = {
     implicit val timeout: Timeout = Timeout(100.millis)
 
-    (persister.get ? Persistence.Persist(key, optValue, seq))
-      .map { _ => MyPersistenceConfirmed(replicator, key, seq) }
+    (myPersister.get ? Persistence.Persist(key, optValue, seq))
+      .map { result =>
+        log.debug(s"result: $result")
+        MyPersistenceConfirmed(replicator, key, seq)
+      }
       .recover {
         case _: AskTimeoutException => MyRetrySnapshotPersistence(replicator, key, optValue, seq)
       } pipeTo self
   }
 
-  def persist(key: String, value: Option[String], id: Long, applicant: ActorRef): Unit = {
-    (persister.get ? Persistence.Persist(key, value, id)).onComplete {
-      case Success(_) => applicant ! OperationAck(id)
-      case Failure(_) => applicant ! OperationFailed(id)
+  protected def processSnapshotPersist(replicator: ActorRef, snapshot: Snapshot): Unit = {
+    val shouldRetry = new AtomicBoolean(true)
+    val persist = Persistence.Persist(snapshot.key, snapshot.valueOption, snapshot.seq)
+    val cancellable = context.system.scheduler.scheduleOnce(1.second) {
+      log.debug(s"Replica/Secondary: timeout for persisting $persist")
+      shouldRetry.set(false)
     }
+    def performPersist(): Unit = {
+
+      (myPersister.get ? persist)(Timeout(100.millis)).onComplete {
+        case Success(message)  =>
+          cancellable.cancel()
+          val ack = SnapshotAck(snapshot.key, snapshot.seq)
+          log.debug(s"Replica/Secondary: Received: $message. Sending back $ack to replicator [${replicator.path}]")
+          replicator ! ack
+        case Failure(exception) if exception.isInstanceOf[AskTimeoutException] =>
+          log.debug(s"Replica/Secondary: ASK Timeout for $persist")
+          if (shouldRetry.get()) performPersist()
+      }
+    }
+
+    performPersist()
+
+  }
+
+
+
+  // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  def persistSnapshot(): Unit = {}
+
+  def persistByInsert(persist: Persist, shouldRetry: AtomicBoolean, cancellable: Cancellable): Future[Boolean] = {
+    val future = ask(myPersister.get, persist)(Timeout(100.millis))
+    future.transformWith {
+      case Failure(exception) if exception.isInstanceOf[AskTimeoutException] =>
+        if (shouldRetry.get()) persistByInsert(persist, shouldRetry, cancellable) else Future.failed(null)
+      case Success(value) =>
+        cancellable.cancel()
+        Future.successful(true)
+    }
+  }
+
+  def processInsertOrRemoveOnLeader(clientRef: ActorRef, id: Long, key: String, optValue: Option[String]): Unit = {
+    val shouldRetry = new AtomicBoolean(true)
+    val persist = Persist(key, optValue, id)
+    val replicate = Replicate(key, optValue, id)
+
+    val cancellable = context.system.scheduler.scheduleOnce(1.second) {
+      shouldRetry.set(false)
+      log.debug(s"Replica/Leader: failed either $persist or $replicate")
+      clientRef ! OperationFailed(id)
+    }
+
+    val persistFuture = persistByInsert(persist, shouldRetry, cancellable)
+    val replicateFuture = processReplicateOnAllSecondaries(replicate)
+
+    Future.sequence(Seq(persistFuture, replicateFuture)).onComplete {
+      case Success(_) =>
+        cancellable.cancel()
+        log.debug(s"Replica/Leader: Successful both persist and replicate for $persist and $replicate")
+        clientRef ! OperationAck(id)
+      case Failure(_) =>
+    }
+  }
+
+  def processReplicateOnAllSecondaries(replicate: Replicate) = {
+
+    val futures = secondaries
+      .filterNot(_._1 == null) // exclude the Leader Replica
+      .keys
+      .map { replicator: ActorRef =>
+        log.debug(s"Replica/Leader: Replicating $replicate on replicate ${replicator.path}")
+        (replicator ? replicate) map { _ => true }
+      }
+
+    Future.sequence(futures).map(_ => true)
   }
 }
 

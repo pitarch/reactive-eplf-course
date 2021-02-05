@@ -9,6 +9,8 @@ import org.junit.Test
 
 trait Step5_PrimaryPersistenceSpec { this: KVStoreSuite =>
 
+
+
   @Test def `Step5-case1: Primary does not acknowledge updates which have not been persisted`(): Unit = {
     val arbiter = TestProbe()
     val persistence = TestProbe()
@@ -66,9 +68,9 @@ trait Step5_PrimaryPersistenceSpec { this: KVStoreSuite =>
   }
 
   @Test def `Step5-case4: Primary generates failure after 1 second if global acknowledgement fails`(): Unit = {
-    val arbiter = TestProbe()
+    val arbiter = TestProbe("arbiter0")
         val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step5-case4-primary")
-        val secondary = TestProbe()
+        val secondary = TestProbe("secondaryTest")
     val client = session(primary)
 
     arbiter.expectMsg(Join)
