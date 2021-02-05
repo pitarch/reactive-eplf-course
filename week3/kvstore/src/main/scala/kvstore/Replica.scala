@@ -151,19 +151,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         }
         myPersistedExpected = myPersistedExpected.updated((key, seq), replicator)
         snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, seq + 1)
-        processSnapshotPersist(replicator, m)
+        //processSnapshotPersist(replicator, m)
+        myPersister.get ! Persistence.Persist(key, optValue, seq)
       }
-
-//    case MyRetrySnapshotPersistence(replicator, key, optValue, seq) =>
-//      log.debug(s"MyRetrySnapshotPersistence: key=$key, value=$optValue, seq=$seq")
-//      retryPersistOnSnapshot(key, optValue, seq, replicator)
-//
-//    case MyPersistenceConfirmed(replicator, key, seq) =>
-//      val replicatorOpt = myPersistedExpected.get((key, seq))
-//      if (replicatorOpt.isDefined) {
-//        replicatorOpt.get ! SnapshotAck(key, seq)
-//        myPersistedExpected = myPersistedExpected.removed((key, seq))
-//      }
 
     case Persisted(key, seq) =>
       val replicatorOpt = myPersistedExpected.get((key, seq))
