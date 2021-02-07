@@ -1,7 +1,7 @@
 package kvstore
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Cancellable, Props}
-import akka.pattern.{AskTimeoutException, ask, pipe}
+import akka.pattern.{AskTimeoutException, ask}
 import akka.util.Timeout
 import kvstore.Arbiter._
 import kvstore.Persistence.{Persist, Persisted}
@@ -9,7 +9,7 @@ import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.Future
-import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.{Duration, DurationInt}
 import scala.util.{Failure, Success}
 
 object Replica {
@@ -36,12 +36,6 @@ object Replica {
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 
-  sealed trait MySnapshotPersistenceOperation
-
-  case class MyRetrySnapshotPersistence(replicator: ActorRef, key: String, optValue: Option[String], seq: Long) extends MySnapshotPersistenceOperation
-
-  case class MyPersistenceConfirmed(replicator: ActorRef, key: String, seq: Long) extends MySnapshotPersistenceOperation
-
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with ActorLogging {
@@ -60,10 +54,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   // mine
   var myPersister: Option[ActorRef] = None
-  var snapshotExpectedSeqs: Map[ActorRef, Long] = Map.empty[ActorRef, Long].withDefaultValue(0)
-  var myPersistedExpected: Map[(String, Long), ActorRef] = Map.empty
-
-
+  var myExpectedSnapshotSeq: Map[ActorRef, Long] = Map.empty[ActorRef, Long].withDefaultValue(0)
+  var myRunningSnapshots: List[SnapshotTask] = List.empty
   implicit val timeout: Timeout = Timeout(1.second)
 
   import context.dispatcher
@@ -134,79 +126,37 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
 
-    case m@Snapshot(key, optValue, seq) => // sender: Replicator
+    case snapshot@Snapshot(key, optValue, seq) => // sender: Replicator
       val replicator = sender
-      val expectedSeq = snapshotExpectedSeqs(replicator)
-      log.debug(s"Replicate/Secondary: received message $m from replicator [${replicator.path}]. expected seq=${expectedSeq}")
-      if (seq > expectedSeq) {
-        // nothing
-      } else if (seq < expectedSeq) {
-        replicator ! SnapshotAck(key, seq)
-        //snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, expectedSeq + 1)
-      } else {
+      val expectedSeq = myExpectedSnapshotSeq(replicator)
+      log.debug(s"Replicate/Secondary: received message $snapshot from replicator [${replicator.path}]. expected seq=${expectedSeq}")
+      if (seq == expectedSeq) {
         log.debug(s"Updated local store (key=$key, value=$optValue)")
         optValue match {
           case Some(value) => kv = kv.updated(key, value)
           case None => kv = kv.removed(key)
         }
-        myPersistedExpected = myPersistedExpected.updated((key, seq), replicator)
-        snapshotExpectedSeqs = snapshotExpectedSeqs.updated(replicator, seq + 1)
-        //processSnapshotPersist(replicator, m)
-        myPersister.get ! Persistence.Persist(key, optValue, seq)
+        myExpectedSnapshotSeq = myExpectedSnapshotSeq.updated(replicator, seq + 1)
+        val task = new SnapshotTask(snapshot, replicator)
+        myRunningSnapshots = task +: myRunningSnapshots
+      } else if (seq < expectedSeq) {
+        replicator ! SnapshotAck(key, seq)
       }
 
-    case Persisted(key, seq) =>
-      val replicatorOpt = myPersistedExpected.get((key, seq))
-      if (replicatorOpt.isDefined) {
-        replicatorOpt.get ! SnapshotAck(key, seq)
-        myPersistedExpected = myPersistedExpected.removed((key, seq))
-      }
+    case persisted: Persisted =>
+      log.debug(s"Replica/Secondary: Received $persisted")
+      myRunningSnapshots
+        .filter(_.snapshot.seq == persisted.id)
+        .foreach { task =>
+          task.cancel()
+          task.ackRef ! SnapshotAck(task.snapshot.key, task.snapshot.seq)
+        }
+      myRunningSnapshots = myRunningSnapshots.filterNot(_.snapshot.seq == persisted.id)
   }
-
-  @Deprecated
-  protected def retryPersistOnSnapshot(key: String, optValue: Option[String], seq: Long, replicator: ActorRef): Unit = {
-    implicit val timeout: Timeout = Timeout(100.millis)
-
-    (myPersister.get ? Persistence.Persist(key, optValue, seq))
-      .map { result =>
-        log.debug(s"result: $result")
-        MyPersistenceConfirmed(replicator, key, seq)
-      }
-      .recover {
-        case _: AskTimeoutException => MyRetrySnapshotPersistence(replicator, key, optValue, seq)
-      } pipeTo self
-  }
-
-  protected def processSnapshotPersist(replicator: ActorRef, snapshot: Snapshot): Unit = {
-    val shouldRetry = new AtomicBoolean(true)
-    val persist = Persistence.Persist(snapshot.key, snapshot.valueOption, snapshot.seq)
-    val cancellable = context.system.scheduler.scheduleOnce(1.second) {
-      log.debug(s"Replica/Secondary: timeout for persisting $persist")
-      shouldRetry.set(false)
-    }
-    def performPersist(): Unit = {
-
-      (myPersister.get ? persist)(Timeout(100.millis)).onComplete {
-        case Success(message)  =>
-          cancellable.cancel()
-          val ack = SnapshotAck(snapshot.key, snapshot.seq)
-          log.debug(s"Replica/Secondary: Received: $message. Sending back $ack to replicator [${replicator.path}]")
-          replicator ! ack
-        case Failure(exception) if exception.isInstanceOf[AskTimeoutException] =>
-          log.debug(s"Replica/Secondary: ASK Timeout for $persist")
-          if (shouldRetry.get()) performPersist()
-      }
-    }
-
-    performPersist()
-
-  }
-
 
 
   // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  def persistSnapshot(): Unit = {}
 
   def persistByInsert(persist: Persist, shouldRetry: AtomicBoolean, cancellable: Cancellable): Future[Boolean] = {
     val future = ask(myPersister.get, persist)(Timeout(100.millis))
@@ -254,5 +204,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     Future.sequence(futures).map(_ => true)
   }
+
+
+  // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // SECONDARY REPLICA
+  // //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  class SnapshotTask(val snapshot: Snapshot, val ackRef: ActorRef) {
+
+    private val persist = Persist(snapshot.key, snapshot.valueOption, snapshot.seq)
+    private val cancellable = context.system.scheduler.scheduleWithFixedDelay(Duration.Zero, 100.millis) { new Runnable {
+      override def run(): Unit = {
+        log.debug(s"Sending Persist to actor ${ackRef.path}")
+        myPersister.get ! persist
+      }
+    }}
+
+    def cancel(): Boolean = {
+      log.debug(s"Cancelling persist $persist for snapshot $snapshot")
+      cancellable.cancel()
+    }
+  }
+
 }
 
