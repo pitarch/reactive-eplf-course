@@ -1,14 +1,15 @@
 package kvstore
 
-import scala.concurrent.duration._
 import akka.testkit.TestProbe
-import Arbiter._
-import Persistence._
-import Replicator._
+import kvstore.Arbiter._
+import kvstore.Persistence._
+import kvstore.Replicator._
 import org.junit.Test
 
-trait Step5_PrimaryPersistenceSpec { this: KVStoreSuite =>
+import scala.concurrent.duration._
 
+trait Step5_PrimaryPersistenceSpec {
+  this: KVStoreSuite =>
 
 
   @Test def `Step5-case1: Primary does not acknowledge updates which have not been persisted`(): Unit = {
@@ -69,8 +70,8 @@ trait Step5_PrimaryPersistenceSpec { this: KVStoreSuite =>
 
   @Test def `Step5-case4: Primary generates failure after 1 second if global acknowledgement fails`(): Unit = {
     val arbiter = TestProbe("arbiter0")
-        val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step5-case4-primary")
-        val secondary = TestProbe("secondaryTest")
+    val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step5-case4-primary")
+    val secondary = TestProbe("secondaryTest")
     val client = session(primary)
 
     arbiter.expectMsg(Join)
@@ -85,9 +86,10 @@ trait Step5_PrimaryPersistenceSpec { this: KVStoreSuite =>
   }
 
   @Test def `Step5-case5: Primary acknowledges only after persistence and global acknowledgement`(): Unit = {
-    val arbiter = TestProbe()
-        val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step5-case5-primary")
-        val secondaryA, secondaryB = TestProbe()
+    val arbiter = TestProbe("arbiter0")
+    val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step5-case5-primary")
+    val secondaryA = TestProbe("secondary-a")
+    val secondaryB = TestProbe("secondary-b")
     val client = session(primary)
 
     arbiter.expectMsg(Join)

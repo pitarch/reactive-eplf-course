@@ -8,7 +8,6 @@ import kvstore.Persistence.{Persist, Persisted}
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
 import scala.concurrent.duration.{Duration, DurationInt}
-import scala.util.{Failure, Success}
 
 object Replica {
 
@@ -74,13 +73,13 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // SECONDARY REPLICA
   // //////////////////////////////////////////////////////////////////////////
 
-  case class PendingUpdate(key: String, id: Long, persisted: Boolean, replicators: Set[ActorRef], cancellable: Cancellable, ackRef: ActorRef)
+  case class PendingUpdate(key: String, id: Long, persisted: Boolean, replicators: Set[ActorRef], globalCancellation: Cancellable, ackRef: ActorRef, persistCancellation: Cancellable = Cancellable.alreadyCancelled)
 
   case class CancelUpdate(key: String, id: Long)
 
   case class RetryPersist(persist: Persist)
 
-  private var pendingUpdates: List[PendingUpdate] = List.empty
+  var pendingUpdates: List[PendingUpdate] = List.empty
 
   val leader: Receive = {
 
@@ -97,25 +96,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       kv = kv.removed(key)
       processUpdateOnLeader(key, id, None)
 
-    case retry@RetryPersist(persist) =>
-      log.debug(s"Replica/Leader: received $retry")
-      if (pendingUpdates.exists { pending => pending.key == persist.key && pending.id == persist.id }) retryPersist(persist)
-
     case persisted@Persisted(key, id) =>
       log.debug(s"Replicate/Primary: Received message: $persisted")
-      val optPending = pendingUpdates
-        .find { pending => pending.key == key && pending.id == id }
-        .map { pending => pending.copy(persisted = true) }
 
-      ackUpdate(optPending)
+      val (targets, others) = pendingUpdates.partition { pending => pending.key == key && pending.id == id }
+      val newTargets = targets.tapEach(_.persistCancellation.cancel()).map(_.copy(persisted = true))
+
+      val (finished, stillPending) = newTargets.partition { pending => pending.persisted && pending.replicators.isEmpty }
+      finished.foreach { pending =>
+        pending.globalCancellation.cancel()
+        pending.ackRef ! OperationAck(id)
+      }
+      pendingUpdates = others ++ stillPending
 
     case replicated@Replicated(key, id) =>
       log.debug(s"Replicate/Leader: Received $replicated")
-      val optPending = pendingUpdates
-        .find { pending => pending.key == key && pending.id == id }
-        .map { pending => pending.copy(replicators = pending.replicators.removedAll(Seq(sender))) }
 
-      ackUpdate(optPending)
+      val (targets, others) = pendingUpdates.partition { pending => pending.key == key && pending.id == id }
+      val newTargets = targets.map { pending => pending.copy(replicators = pending.replicators.removedAll(Seq(sender))) }
+
+      val (finished, stillPending) = newTargets.partition { pending => pending.persisted && pending.replicators.isEmpty }
+      finished.foreach { pending =>
+        pending.globalCancellation.cancel()
+        pending.ackRef ! OperationAck(id)
+      }
+      pendingUpdates = others ++ stillPending
 
     case cancel@CancelUpdate(key, id) =>
       log.debug(s"Replicate/Leader: Received $cancel")
@@ -145,19 +150,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   private def processUpdateOnLeader(key: String, id: Long, optValue: Option[String]) = {
     val clientRef = sender
-    val cancellable = context.system.scheduler.scheduleOnce(1.second) {
-      self ! CancelUpdate(key, id)
+    val myself = self
+    val persist = Persist(key, optValue, id)
+    val persistCancellation = context.system.scheduler.scheduleWithFixedDelay(Duration.Zero, 100.millis, myPersister.get, persist)
+    val globalCancellation = context.system.scheduler.scheduleOnce(1.second) {
+      persistCancellation.cancel()
       clientRef ! OperationFailed(id)
+      myself ! CancelUpdate(key, id)
     }
 
-    val pendingUpdate = PendingUpdate(key, id, persisted = false, secondaries.values.toSet, cancellable, sender)
+    val pendingUpdate = PendingUpdate(key, id, persisted = false, secondaries.values.toSet, globalCancellation, sender, persistCancellation)
     pendingUpdates = pendingUpdate +: pendingUpdates
-    val persist = Persist(key, optValue, id)
-    retryPersist(persist)
     pendingUpdate.replicators.foreach { replicator => replicator ! Replicate(key, optValue, id) }
   }
 
 
+  @Deprecated
   private def ackUpdate(optPending: Option[PendingUpdate]) = {
     optPending.foreach { pending =>
       val finished = pending.persisted && pending.replicators.isEmpty
@@ -226,7 +234,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         // nothing
       } else {
         log.debug(s"Replica/Secondary: Trying to persist $snapshot")
-        kv = if (optValue.isDefined)  kv.updated(key, optValue.get) else kv.removed(key)
+        kv = if (optValue.isDefined) kv.updated(key, optValue.get) else kv.removed(key)
         val persist = Persist(key, optValue, seq)
         val retryCancellable = context.system.scheduler.scheduleWithFixedDelay(Duration.Zero, 100.millis, myPersister.get, persist)
         val pending = PendingSnapshot(key, seq, sender, retryCancellable)
@@ -238,7 +246,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       val maybeSnapshot = pendingSnapshots.find { pending => pending.key == key && pending.seq == id }
       maybeSnapshot.foreach { pending =>
         pending.retry.cancel()
-        expectedSnapshotSeq = expectedSnapshotSeq.updated(key, List(id+1, expectedSnapshotSeq(key)).max)
+        expectedSnapshotSeq = expectedSnapshotSeq.updated(key, List(id + 1, expectedSnapshotSeq(key)).max)
         pending.ackRef ! SnapshotAck(key, id)
         pendingSnapshots = pendingSnapshots.filterNot { target => target.key == pending.key && target.seq == pending.seq }
       }
