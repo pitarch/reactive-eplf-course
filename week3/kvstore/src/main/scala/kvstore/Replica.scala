@@ -129,21 +129,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case m@Replicas(replicas) =>
       log.debug(s"Replica/Leader: received $m")
 
-      // kill removed secondary replicas
-      secondaries.keys.filterNot(replicas.contains).foreach {
-        _ ! PoisonPill
-      }
-      // find the new added secondary replicas and create a replicator for them
-      val newSecondaries = replicas.filterNot(_ == self).filterNot(secondaries.contains)
-      secondaries = secondaries ++ newSecondaries.map(secondary => secondary -> context.actorOf(Replicator.props(secondary)))
+      val removedReplicas = secondaries.keys.filterNot(replicas.contains).toSet
+      val (activeReplicas, newReplicas) = replicas.filterNot(_ == self).partition(secondaries.contains)
 
-      val task = new ReplicationTask(nextReplicationId(), kv.keys.toSet, sender)
-      replicationTask = Some(task)
-      newSecondaries.foreach(task.addReplicator)
-      // For each pair key-value, send a Replicate message to every replicator
+      // stop removed replicators and remove them from secondaries
+      secondaries.filter { case (replica, _) => removedReplicas.contains(replica) }.values.foreach(_ ! PoisonPill)
+      secondaries = secondaries.removedAll(removedReplicas)
+
+      // create new replicators
+      secondaries = secondaries ++ newReplicas.map { replica => replica -> context.actorOf(Replicator.props(replica)) }
+
+      val replicationId = nextReplicationId()
       kv.foreach {
-        case (key, value) => newSecondaries.foreach { secondary =>
-          secondaries(secondary) ! Replicate(key, Some(value), task.replicationId)
+        case (key, value) => newReplicas.foreach { secondary =>
+          val replicator = secondaries(secondary)
+          replicator ! Replicate(key, Some(value), replicationId)
         }
       }
   }
@@ -165,22 +165,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
 
-  @Deprecated
-  private def ackUpdate(optPending: Option[PendingUpdate]) = {
-    optPending.foreach { pending =>
-      val finished = pending.persisted && pending.replicators.isEmpty
-      if (finished) {
-        pendingUpdates = pendingUpdates.filterNot { target => target.key == pending.key && target.id == pending.id }
-        pending.ackRef ! OperationAck(pending.id)
-      }
-    }
-  }
-
-  private def retryPersist(persist: Persist) = {
-    ((myPersister.get ? persist) (Timeout(100.millis), self))
-      .recover { case _: AskTimeoutException => RetryPersist(persist) }
-      .pipeTo(self)
-  }
 
 
   var replicationId: Long = 0L
