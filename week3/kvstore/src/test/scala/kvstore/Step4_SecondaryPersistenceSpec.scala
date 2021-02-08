@@ -41,9 +41,9 @@ trait Step4_SecondaryPersistenceSpec { this: KVStoreSuite =>
   @Test def `Step4-case2: Secondary should retry persistence in every 100 milliseconds`(): Unit = {
     import Replicator._
 
-    val arbiter = TestProbe()
-    val persistence = TestProbe()
-    val replicator = TestProbe()
+    val arbiter = TestProbe("arbiter0")
+    val persistence = TestProbe("persistence0")
+    val replicator = TestProbe("replicator0")
     val secondary = system.actorOf(Replica.props(arbiter.ref, probeProps(persistence)), "step4-case2-secondary")
     val client = session(secondary)
 

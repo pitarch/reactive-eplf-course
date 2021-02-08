@@ -1,12 +1,10 @@
 package kvstore
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
-import akka.pattern.{AskTimeoutException, ask}
+import akka.pattern.{AskTimeoutException, ask, pipe}
 import akka.util.Timeout
 
-import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.DurationInt
-import scala.util.{Failure, Success}
 
 object Replicator {
 
@@ -26,62 +24,40 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
   import Replicator._
   import context.dispatcher
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
-
-  // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
-
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  var pending = Vector.empty[Snapshot]
-
-  var _seqCounter = 0L
-
-  def nextSeq() = {
-    val ret = _seqCounter
-    _seqCounter += 1
-    ret
-  }
-
   implicit val timeout = Timeout(100.millis)
+
+  case class RetryReplicate(replicate: Replicate, ackRef: ActorRef)
+
+  private var pendingReplicates: List[RetryReplicate] = List.empty
 
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
 
-    case message: Replicate =>
-      log.debug(s"Replicator: Received message $message from ${sender.path}")
-      replicate(sender, message)
+    case replicate@Replicate(key, valueOption, id) =>
+      log.debug(s"Replicator: received $replicate")
+      val leaderRef = sender
+      // remove older replications for this key having
+      pendingReplicates = pendingReplicates.filterNot { pending => pending.replicate.key == key && pending.replicate.id <= id }
 
-    //    case SnapshotAck(_, seq) =>
-    //      val entry = acks.get(seq)
-    //      acks = acks.removed(seq)
-    //      entry.foreach {
-    //        case (replicaRef, Replicate(key, _, id)) => replicaRef ! Replicated(key, id)
-    //      }
-  }
+      val retryReplicate = RetryReplicate(replicate, leaderRef)
+      // send snapshot to replica and inject the reply to myself.
+      (replica ? Snapshot(key, valueOption, id))
+        .recover { case _: AskTimeoutException => retryReplicate }
+        .pipeTo(self)
+      pendingReplicates = retryReplicate +: pendingReplicates
 
+    case retryReplicate@RetryReplicate(m@Replicate(key, valueOption, id), replicator) =>
+      log.debug(s"Replicator: received $retryReplicate")
+      if (pendingReplicates.contains(retryReplicate))
+        (replica ? Snapshot(key, valueOption, id))
+          .recover { case _: AskTimeoutException => RetryReplicate(m, replicator)
+          }.pipeTo(self)
 
-  protected def replicate(leader: ActorRef, replicate: Replicate): Unit = {
-    val snapshot = Snapshot(replicate.key, replicate.valueOption, nextSeq())
-    val shouldRetry = new AtomicBoolean(true)
-    context.system.scheduler.scheduleOnce(1.second) {
-      shouldRetry.set(false)
-    }
-
-    def sendSnapshot(): Unit = {
-      log.debug(s"Replicator: Sending $snapshot to replica ${replica.path}")
-      (replica ? snapshot) (Timeout(100.millis)).onComplete {
-        case Failure(exception) if exception.isInstanceOf[AskTimeoutException] =>
-          log.debug(s"Replicator: received Timeout by $snapshot. Resending? ${shouldRetry}")
-          if (shouldRetry.get()) sendSnapshot()
-        case Success(m@SnapshotAck(key, id)) =>
-          log.debug(s"Replicator: Get $m from replica ${replica.path}. Sending Replicated to leader ${leader.path}")
-          leader ! Replicated(key, id)
-      }
-    }
-
-    sendSnapshot()
-
+    case snapshotAck@SnapshotAck(key, seq) =>
+      log.debug(s"Replicator: received $snapshotAck")
+      pendingReplicates
+        .find { r => r.replicate.key == key && r.replicate.id == seq }
+        .foreach { pending => pending.ackRef ! Replicated(key, seq)
+        }
   }
 }
