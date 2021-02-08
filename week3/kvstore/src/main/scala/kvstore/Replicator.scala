@@ -25,10 +25,12 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
 
   implicit val timeout = Timeout(100.millis)
 
-  case class RetryReplicate(replicate: Replicate, ackRef: ActorRef, retry: Cancellable = Cancellable.alreadyCancelled)
+  case class RetryReplicate(replicate: Replicate, ackRef: ActorRef, retry: Cancellable = Cancellable.alreadyCancelled, seq: Long = 0)
   case class CancelReplicate(replicate: Replicate)
 
   private var pendingReplicates: List[RetryReplicate] = List.empty
+
+  private var snapshotSeq: Long = 0L
 
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
@@ -37,29 +39,40 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
       log.debug(s"Replicator: received $replicate")
       val leaderRef = sender
       // remove older replications for this key having. They will be cancelled
-      val olderReplicates = pendingReplicates.filter { pending => pending.replicate.key == key && pending.replicate.id <= id }
-      olderReplicates.foreach(_.retry.cancel())
-      pendingReplicates = pendingReplicates.toSet.removedAll(olderReplicates).toList
+      val alreadyExisting = pendingReplicates.find { pending => pending.replicate.key == key && pending.replicate.id  == id }
 
-      val snapshot = Snapshot(key, valueOption, id)
-      val retry = context.system.scheduler.scheduleWithFixedDelay(Duration.Zero, 200.millis, replica, snapshot)
-      val retryReplicate = RetryReplicate(replicate, leaderRef, retry)
-      // send snapshot to replica and inject the reply to myself.
-      replica ! snapshot
-      pendingReplicates = retryReplicate +: pendingReplicates
+      if (alreadyExisting.isEmpty) {
+        val snapshot = Snapshot(key, valueOption, snapshotSeq)
+        snapshotSeq += 1
+        val retry = context.system.scheduler.scheduleWithFixedDelay(Duration.Zero, 100.millis, replica, snapshot)
+        val retryReplicate = RetryReplicate(replicate, leaderRef, retry, snapshot.seq)
+        // send snapshot to replica and inject the reply to myself.
+        log.debug(s"Replicator: ...Sending $snapshot to replica ${replica.path}")
+        pendingReplicates = retryReplicate +: pendingReplicates
+        replica ! snapshot
+      } else {
+        val pending = alreadyExisting.get
+        val snapshot = Snapshot(key, valueOption, pending.seq)
+        log.debug(s"Replicator: Already exist $replicate... resending $snapshot")
+        replica ! snapshot
+      }
 
     case snapshotAck@SnapshotAck(key, seq) =>
       log.debug(s"Replicator: received $snapshotAck")
-      val ackedReplicates = pendingReplicates.filter { pending => pending.replicate.key == key && pending.replicate.id == seq }
+      val ackedReplicates = pendingReplicates.filter { pending => pending.replicate.key == key && pending.seq == seq }
       pendingReplicates = pendingReplicates.toSet.removedAll(ackedReplicates).toList
       ackedReplicates.foreach { retryReplicate =>
         retryReplicate.retry.cancel()
-        retryReplicate.ackRef ! Replicated(key, seq)
+        retryReplicate.ackRef ! Replicated(key, retryReplicate.replicate.id)
       }
 
     case CancelReplicate(replicate: Replicate) =>
       val targets = pendingReplicates.filter { pending => pending.replicate.key == replicate.key && pending.replicate.id == replicate.id }
       targets.foreach(_.retry.cancel())
       pendingReplicates = pendingReplicates.toSet.removedAll(targets).toList
+  }
+
+  override def postStop(): Unit = {
+    log.debug(s"Stopping replicator")
   }
 }

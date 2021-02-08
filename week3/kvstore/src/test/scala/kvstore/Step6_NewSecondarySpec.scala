@@ -54,10 +54,10 @@ trait Step6_NewSecondarySpec { this: KVStoreSuite =>
   }
 
   @Test def `Step6-case3: Primary must stop replication to removed replicas and waive their outstanding acknowledgements`(): Unit = {
-    val arbiter = TestProbe()
+    val arbiter = TestProbe("arbiter0")
         val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step6-case3-primary")
         val user = session(primary)
-    val secondary = TestProbe()
+    val secondary = TestProbe("secondary0")
 
     arbiter.expectMsg(Join)
     arbiter.send(primary, JoinedPrimary)
