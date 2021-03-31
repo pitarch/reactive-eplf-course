@@ -1,3 +1,5 @@
 target/
 *.zip
 .bsp/
+.DS_Store
+project/
